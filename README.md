@@ -1,6 +1,6 @@
 # Check
 
-An imperative unit testing style built on top of rspec.
+An declarative unit testing style built on top of rspec.
 
 # Code:
 
