@@ -1,5 +1,7 @@
-gem 'rspec', path: '../rspec'
-gem 'rspec-expectations', path: '../rspec-expectations'
-gem 'rspec-mocks', path: '../rspec-mocks'
-gem 'rspec-core', path: '../rspec-core'
-gem 'rspec-support', path: '../rspec-support'
+source 'https://rubygems.org'
+
+gem 'rspec'
+gem 'rspec-expectations'
+gem 'rspec-mocks'
+gem 'rspec-core'
+gem 'rspec-support'

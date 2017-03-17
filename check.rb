@@ -1,6 +1,6 @@
 gem 'rspec'
-require 'rspec'
-require 'rspec-expectations'
+require 'rspec/core'
+require 'rspec/expectations'
 require 'rspec/autorun'
 require 'pp'
 
@@ -12,23 +12,59 @@ RSpec.configure do |config|
   end
 end
 
+class NicePrintHash < Hash
+  def initialize(hash, &block)
+    for k, v in hash
+      self[k] = v
+    end
+    super(&block)
+  end
+
+  def to_s
+    result = []
+    for k, v in self
+      result << "#{k}: #{v.inspect}"
+    end
+    result.join(', ')
+  end
+end
+
+class LiteralString < String
+  def initialize(str)
+    super(str)
+  end
+
+  def inspect
+    self
+  end
+end
+
 module Check
   class Scope
     include ::RSpec::Matchers
 
-    attr_reader :vars, :all_vars, :rspec_group
+    attr_reader :local_vars, :code_vars, :all_vars, :all_code_vars, :rspec_group
 
-    def initialize(vars, parent: nil, &block)
-      @vars = vars
+    def initialize(local_vars: nil, code_vars: nil, parent: nil, doc: nil, &block)
+      #p vars: local_vars, code: code_vars
+      @local_vars = NicePrintHash.new(local_vars || {})
+      @code_vars = NicePrintHash.new(code_vars || {})
       @parent = parent
       @block = block
+      @doc = doc
       copy_parent_vars
       setup_rspec_group
       setup_vars
+      setup_code_vars
     end
 
-    def with(vars, &block)
-      scope = Scope.new(vars, parent: self, &block)
+    def context(args, &block)
+      scope = Scope.new(local_vars: args, parent: self, &block)
+      scope.evaluate
+    end
+
+    def code(code_proc, &block)
+      scope = Scope.new(code_vars: {call: code_proc}, parent: self, &block)
       scope.evaluate
     end
 
@@ -42,17 +78,17 @@ module Check
     end
 
     def result(&block)
-      example = Example.new(@all_vars, parent: self, &block)
-      subject = instance_eval(&@all_vars[:call])
+      example = Example.new(local_vars: {}, parent: self, &block)
+      subject = call_instance.call
       example.add_to_rspec_group(subject, 'result', nil, @rspec_group)
     end
 
     def call(desc=nil, &block)
-      example = Example.new(@all_vars, parent: self, &block)
-      s = self
-      c = @all_vars[:call]
-      x = proc { s.instance_eval(&c) }
-      example.add_to_rspec_group(x, 'call', desc, @rspec_group)
+      if block
+        call_context(desc, &block)
+      else
+        call_instance
+      end
     end
 
     def evaluate
@@ -60,6 +96,17 @@ module Check
     end
 
     private
+
+    def call_context(desc, &block)
+      example = Example.new(local_vars: @all_vars, parent: self, &block)
+      example.add_to_rspec_group(call_instance, 'call', desc, @rspec_group)
+    end
+
+    def call_instance
+      scope = self
+      code = scope.all_code_vars[:call]
+      proc { scope.instance_exec(&code) }
+    end
 
     def setup_rspec_group
       if @parent
@@ -70,38 +117,69 @@ module Check
     end
 
     def rspec_group_args
-      @vars.select{|k,v| k != :description }
+      local_vars.select{|k,v| k != :doc }
     end
 
     def description
-      @vars[:description] || description_from_vars
+      return @doc if !@doc.nil?
+      if local_vars.any?
+        "context #{local_vars}"
+      else
+        if call = code_vars[:call]
+          path, line = call.source_location
+          line_of_code = File.read(path).lines[line - 1]
+          if m = line_of_code.match(/->\s*{\s*(.*?)\s*}\s*do/)
+            line_of_code = LiteralString.new(m.captures.first)
+          end
+          "code #{line_of_code}"
+        else
+          "#{code_vars}"
+        end
+      end
     end
 
     def description_from_vars
-      "with #{@vars.select{|k,v| !v.is_a?(Proc) }.inspect}"
+      "with #{local_vars.select{|k,v| !v.is_a?(Proc) }.inspect}"
     end
 
     def copy_parent_vars
       if @parent
-        @all_vars = @parent.all_vars.merge(vars)
+        @all_vars = @parent.all_vars.merge(local_vars)
+        @all_code_vars = @parent.all_code_vars.merge(code_vars)
       else
-        @all_vars = vars
+        @all_vars = local_vars
+        @all_code_vars = code_vars
       end
     end
 
     def setup_vars
-      @all_vars.each do |name, value|
+      all_vars.each do |name, value|
         if not special_methods.include?(name)
           define_singleton_method(name) { value }
         end
       end
-      @vars.each do |name, value|
-        @rspec_group.let(name) { value }
+      local_vars.each do |name, value|
+        if not special_methods.include?(name)
+          @rspec_group.let(name) { value }
+        end
+      end
+    end
+
+    def setup_code_vars
+      all_code_vars.each do |name, value|
+        if not special_methods.include?(name)
+          define_singleton_method(name) { eval(value) }
+        end
+      end
+      code_vars.each do |name, value|
+        if not special_methods.include?(name)
+          @rspec_group.let(name) { eval(value) }
+        end
       end
     end
 
     def special_methods
-      [:description, :call, :result, :with]
+      [:call]
     end
   end
 
@@ -113,17 +191,22 @@ module Check
         it(desc, &block)
       end
     end
-
   end
 
   def self.with(vars, &block)
-    scope = Scope.new(vars, &block)
+    scope = Scope.new(local_vars: vars, &block)
+    scope.evaluate
+  end
+
+  def self.namespace(&block)
+    scope = Scope.new(doc: 'Check', &block)
     scope.evaluate
   end
 
   def with(*args, &block)
     self.class.with(*args, &block)
   end
+
 end
 
 # -----
@@ -141,21 +224,40 @@ class Sum
   end
 end
 
-Check.with sum: Sum.new do
-  with call: proc { sum.calc(a, b, c) }, description: 'sum.calc(a, b, c)' do
+Check.namespace do
+  context sum: Sum.new do
+    code -> { sum.calc(a, b, c) } do
 
-    with a: 1, b: 2, c: 3 do
-      result { should eq 6 }
-      call { should change(sum, :times_summed).by(1) }
+      context a: 1, b: 2, c: 3 do
+        result { should eq 6 }
+        call { should change(sum, :times_summed).by(1) }
+      end
 
-      it 'should add 1 to times_summed' do
-        call.should change(sum, :times_summed).by(1)
+      context a: 2, b: 4, c: 5 do
+        result { should eq 11 }
+      end
+
+      it 'should add 10, 20, 30 to 60 (verbose and flexible version)' do
+        sum.calc(10, 20, 30).should eq 60
       end
     end
-
-    with a: 2, b: 4, c: 5 do
-      result { should eq 11 }
-    end
-
   end
 end
+
+# Output:
+#
+# Check
+#   context sum: #<Sum:0x007f959c240750 @times_summed=0>
+#     code sum.calc(a, b, c)
+#       should add 10, 20, 30 to 60 (verbose and flexible version)
+#       context a: 1, b: 2, c: 3
+#         result
+#           should eq 6
+#         call
+#           should change #times_summed by 1
+#       context a: 2, b: 4, c: 5
+#         result
+#           should eq 11
+#
+# Finished in 0.0034 seconds (files took 0.09671 seconds to load)
+# 4 examples, 0 failures
